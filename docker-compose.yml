@@ -1,0 +1,52 @@
+services:
+  qdrant:
+    image: ${QDRANT_IMAGE:-qdrant/qdrant:latest}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${QDRANT_PORT:-6333}:6333"
+    volumes:
+      - qdrant_storage:/qdrant/storage
+      - qdrant_snapshots:/qdrant/snapshots
+
+  api:
+    build: .
+    restart: unless-stopped
+    entrypoint: ["python", "-m", "uvicorn"]
+    command: ["src.api:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DOCUMENTS_DIR: /app/documents
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_API_KEY: ""
+    ports:
+      - "127.0.0.1:${RAG_API_PORT:-8000}:8000"
+    depends_on:
+      qdrant:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+  app:
+    profiles: ["cli"]
+    build: .
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DOCUMENTS_DIR: /app/documents
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_API_KEY: ""
+    volumes:
+      - ./documents:/app/documents:ro
+    depends_on:
+      qdrant:
+        condition: service_started
+
+volumes:
+  qdrant_storage:
+  qdrant_snapshots:

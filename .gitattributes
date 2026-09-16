@@ -1,0 +1,54 @@
+* text=auto
+*.py text eol=lf
+*.pyi text eol=lf
+*.ipynb text eol=lf
+*.sql text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.toml text eol=lf
+*.cfg text eol=lf
+*.ini text eol=lf
+*.env text eol=lf
+*.txt text eol=lf
+*.md text eol=lf
+*.rst text eol=lf
+*.json text eol=lf
+*.editorconfig text eol=lf
+*.sh text eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.svg binary
+*.webp binary
+*.ttf binary
+*.otf binary
+*.woff binary
+*.woff2 binary
+*.pdf binary
+*.xlsx binary
+*.xls binary
+*.docx binary
+*.pptx binary
+*.zip binary
+*.tar binary
+*.gz binary
+*.7z binary
+*.pkl binary
+*.pickle binary
+*.joblib binary
+*.h5 binary
+*.pt binary
+*.pth binary
+*.ipynb linguist-language=Python
+*.yml linguist-detectable=false
+*.toml linguist-detectable=false
+*.cfg linguist-detectable=false
+*.ini linguist-detectable=false
+*.txt linguist-detectable=false
+*.md linguist-documentation
+docs/ linguist-documentation
