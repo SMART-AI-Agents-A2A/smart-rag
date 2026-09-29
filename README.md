@@ -1,83 +1,31 @@
 # smart_rag
 
-[English](readme.en.md)
+[Português](README.ptbr.md)
 
-Serviço de recuperação de documentos para um backend maior. Recebe uma pergunta,
-busca trechos no Qdrant e devolve contexto com fontes. **Não gera respostas.**
-O projeto consumidor escolhe seu LLM e usa os trechos para embasar a própria resposta.
+A **document retrieval** service for a larger backend. It indexes PDFs and returns relevant passages with sources for each question. **It does not generate answers**: the consuming backend chooses its LLM and uses the retrieved context to ground the final answer.
 
-## Arquitetura
+**RAG type:** dense semantic retrieval with character windows and Top-K vector search. The consuming backend handles generation, which completes the RAG flow. There is no keyword search, hybrid retrieval, reranking, or agent. The vector database is **Qdrant**, used locally through the embedded `qdrant-client` mode or as a server through `QDRANT_URL`; the similarity metric is cosine.
+
+## How it works
 
 ```text
-documents/*.pdf → pages → chunks → Qwen embeddings (OpenRouter) → Qdrant
-
-Backend → question → POST /retrieve → question embedding → Qdrant Top-K
-        ← context + chunks + metadata
-
-Backend → its own LLM → final answer
+Ingestion: documents/*.pdf → pages → chunks → embeddings (OpenRouter) → Qdrant
+Query:     question → embedding (OpenRouter) → Qdrant Top-K search
+           → score filter → context budget → context + chunks
+Application: consuming backend → its LLM → final answer to the user
 ```
 
-- `src/api.py`: interface HTTP `POST /retrieve`.
-- `src/rag.py`: interface Python `RAG.retrieve()` e `RAG.ingest()`.
-- `src/main.py`: CLI `inspect`, `ingest` e `retrieve`.
-- `src/llm_client.py`: transporte HTTP usado apenas pela API de embeddings.
+1. `src/pdf_loader.py` reads `*.pdf` files directly from `DOCUMENTS_DIR`, sorted by name. It extracts text with `pypdf`, skips empty pages, and preserves the original page numbers starting at 1. There is no OCR.
+2. `src/chunker.py` divides each page into windows of up to `CHUNK_SIZE` Unicode characters, sharing `CHUNK_OVERLAP` characters between windows. Chunks never cross pages; `chunk_index` starts at 0 on each page. Windows may split words.
+3. `src/embeddings.py` sends texts in batches of `BATCH_SIZE` to OpenRouter's `POST /embeddings`. Documents receive no prefix; when configured, the question uses `Instruct: {QUERY_INSTRUCTION}\nQuery: {question}`. The client validates vector counts, indices, dimensions, and values.
+4. `src/vector_store.py` writes vectors to Qdrant using cosine distance. Each point stores text, PDF filename, page number, chunk index, and an embedding configuration signature. Queries check the signature and vector dimension to prevent use of an incompatible index.
+5. `src/retriever.py` requests up to `TOP_K` results above `SCORE_THRESHOLD`, ordered by relevance. It assembles `context` from **complete** passages numbered `[1]`, `[2]`, etc., within `MAX_CONTEXT_CHARS` characters, including headers. If a passage does not fit, a smaller later one may still be included. `chunks` contains exactly the included passages, with text, source, page, and score.
 
-O modelo configurado é `qwen/qwen3-embedding-8b`. Não há geração, chat,
-`LLM_MODEL` ou endpoint `/ask`. Nenhuma chamada é feita a `/chat/completions`.
+The backend receives the user's message, resolves conversation references when needed, calls `POST /retrieve`, and sends the question and context to **its own** generation model. Treat PDF text as data, not instructions. This service has no `/ask`, `RAG.ask()`, `LLM_MODEL`, or `/chat/completions` calls.
 
-## Responsabilidades na aplicação maior
+## Installation and configuration
 
-| Etapa | Este serviço | Backend consumidor |
-| --- | --- | --- |
-| Preparação | Extrai PDFs, divide em chunks e armazena embeddings no Qdrant | Disponibiliza os documentos e coordena a ingestão |
-| Pergunta | Recebe a pergunta em `/retrieve` e gera seu embedding | Recebe a mensagem do usuário e resolve referências ao histórico |
-| Recuperação | Busca trechos e retorna `context`, `chunks` e metadados | Seleciona como usar o contexto e trata resultados vazios |
-| Geração | Retorna os dados recuperados | Envia pergunta e contexto ao próprio LLM antes de gerar a resposta |
-| Entrega | Fornece PDF, página, texto e score dos trechos | Apresenta a resposta final e suas fontes ao usuário |
-
-O RAG completo reúne recuperação e geração. Este repositório fornece a parte
-de recuperação; o backend consumidor implementa a geração fundamentada nesses dados.
-
-## Tecnologias utilizadas
-
-### Linguagem e bibliotecas
-
-| Tecnologia | Versão / origem | Uso no projeto |
-| --- | --- | --- |
-| Python | 3.12; validado com 3.12.14 | Implementação do pipeline e interfaces Python/HTTP |
-| pypdf | 6.19.0 | Extração de texto e metadados por página de PDF |
-| qdrant-client | 1.19.1 | Acesso ao Qdrant embutido ou servidor; gravação e busca de vetores |
-| python-dotenv | 1.2.3 | Carregamento da configuração do `.env` |
-| FastAPI | 0.141.1 | Endpoint `POST /retrieve`, validação HTTP e documentação OpenAPI |
-| Uvicorn | 0.53.0 | Servidor ASGI que executa a API |
-| Pydantic | Dependência transitiva do FastAPI/qdrant-client | Validação do corpo da requisição em `src/api.py` |
-| Biblioteca padrão Python | Incluída no Python 3.12 | `dataclasses`, `pathlib`, `urllib.request`, `json`, `uuid`, `argparse` e sincronização |
-| unittest / unittest.mock | Incluídos no Python 3.12 | Testes automatizados e simulação das respostas de embeddings |
-
-As versões das dependências diretas estão fixadas em `requirements.txt`.
-Dependências transitivas não são fixadas individualmente.
-
-### Modelo, serviços e execução
-
-| Tecnologia | Configuração atual | Uso no projeto |
-| --- | --- | --- |
-| Qwen3 Embedding 8B | `qwen/qwen3-embedding-8b` | Vetorização de documentos e perguntas |
-| OpenRouter | `https://openrouter.ai/api/v1/embeddings` | Acesso remoto ao modelo de embeddings via HTTP com chave Bearer |
-| Qdrant | Embutido ou imagem `qdrant/qdrant:latest` | Persistência de vetores/metadados e recuperação Top-K por similaridade de cosseno |
-| Docker | Imagem base `python:3.12-slim` | Empacotamento da API e da CLI |
-| Docker Compose | v2.24+ | Execução dos serviços `qdrant`, `api` e `app`, rede e volumes persistentes |
-| HTTP / JSON / OpenAPI | `/retrieve`, `/docs` e `/openapi.json` | Contrato de integração com o backend consumidor |
-
-Qdrant embutido usa a implementação do cliente Python; a versão da imagem do
-servidor é independente de `qdrant-client`. `latest` e `3.12-slim` são tags
-mutáveis. Docker é opcional para execução com Python e Qdrant embutido.
-Node.js/TypeScript aparece como exemplo de consumo e não é uma dependência do serviço.
-
-## Instalação
-
-Requer Python 3.12 e chave OpenRouter com acesso ao modelo e créditos.
-Embeddings precisam de acesso à rede. Docker/Compose v2.24+ é opcional.
-Na raiz do repositório:
+Requires Python 3.12, an OpenRouter key with access to the embedding model, and network access. Docker is optional. From the repository root:
 
 ```bash
 python3.12 -m venv .venv
@@ -86,108 +34,114 @@ python -m pip install -r requirements.txt
 cp -n .env.example .env
 ```
 
-Se `.venv` já existir, apenas ative-a. `cp -n` preserva um `.env` existente.
-Preencha a chave no `.env`; nunca a envie no corpo da requisição ao RAG.
+Set `OPENROUTER_API_KEY` in `.env`. `cp -n` preserves an existing file; environment variables take precedence over `.env`. Keep the key on the server, never in a request body. LangChain, LlamaIndex, and an OpenRouter SDK are not required.
 
-```dotenv
-OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
-OPENROUTER_API_KEY=your-key
-EMBEDDING_MODEL=qwen/qwen3-embedding-8b
-```
+### Versions used
 
-Dependências diretas: `pypdf==6.19.0`, `qdrant-client==1.19.1`,
-`python-dotenv==1.2.3`, `fastapi==0.141.1`, `uvicorn==0.53.0`.
-Sem LangChain, LlamaIndex ou SDK OpenRouter. Não há instalação via `pip install .`.
-
-## Configuração
-
-O `.env` é carregado da raiz; variáveis do ambiente prevalecem sobre ele.
-Opções explícitas da CLI/HTTP/Python prevalecem sobre os respectivos padrões.
-Caminhos relativos do `.env` são relativos à raiz; `inspect --documents-dir`
-é relativo ao diretório atual.
-
-| Variável | Padrão | Função |
+| Component | Version in this project | Purpose |
 | --- | --- | --- |
-| `DOCUMENTS_DIR` | `documents` | Pasta dos PDFs |
-| `CHUNK_SIZE` | `1000` | Caracteres por chunk |
-| `CHUNK_OVERLAP` | `200` | Sobreposição em caracteres |
-| `BATCH_SIZE` | `16` | Textos por chamada de embeddings |
-| `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` | URL base |
-| `OPENROUTER_API_KEY` | `—` | Chave Bearer; padrão vazio |
-| `EMBEDDING_MODEL` | `qwen/qwen3-embedding-8b` | Modelo de embeddings |
-| `QUERY_INSTRUCTION` | `Given a web search query, retrieve relevant passages that answer the query` | Prefixo da consulta; vazio desativa |
-| `REQUEST_TIMEOUT` | `180` | Timeout em segundos por chamada |
-| `QDRANT_URL` | `—` | Vazio: embutido; preenchido: servidor |
-| `QDRANT_API_KEY` | `—` | Chave do Qdrant; padrão vazio |
-| `QDRANT_PATH` | `data/qdrant` | Pasta do banco embutido |
-| `QDRANT_COLLECTION` | `smart_rag` | Coleção do índice |
-| `TOP_K` | `4` | Máximo de hits antes do orçamento de contexto |
-| `SCORE_THRESHOLD` | `0.3` | Similaridade mínima de cosseno |
-| `MAX_CONTEXT_CHARS` | `6000` | Orçamento incluindo cabeçalhos |
-| `QDRANT_IMAGE` | `qdrant/qdrant:latest` | Imagem Compose |
-| `QDRANT_PORT` | `6333` | Porta Qdrant no host (Compose) |
-| `RAG_API_PORT` | `8000` | Porta do RAG no host (Compose) |
+| Python | 3.12; `python:3.12-slim` image | Pipeline, CLI, and API |
+| `pypdf` | 6.19.0 | PDF text extraction |
+| `qdrant-client` | 1.19.1 | Embedded Qdrant or server access |
+| `python-dotenv` | 1.2.3 | `.env` loading |
+| `fastapi` | 0.141.1 | HTTP API and validation |
+| `uvicorn` | 0.53.0 | API server |
+| Qdrant server | `qdrant/qdrant:latest` | Vector database in Compose; version not pinned |
+| Embedding model | `qwen/qwen3-embedding-8b` | Default OpenRouter model ID; remote revision not pinned |
 
-Tamanho, lote, Top-K, orçamento e timeout devem ser positivos.
-`0 <= CHUNK_OVERLAP < CHUNK_SIZE`; limiar entre -1 e 1.
-`inspect` funciona sem chave e sem abrir o banco.
+Direct library versions are pinned in `requirements.txt`; transitive dependencies and the Qdrant image are not pinned.
 
-## Ingestão e CLI
+### `.env` parameters
 
-Coloque os PDFs em `documents/` e execute na raiz:
+| Variable | Type / default | Effect |
+| --- | --- | --- |
+| `DOCUMENTS_DIR` | path / `documents` | Directory read during ingestion; only top-level `*.pdf` files |
+| `CHUNK_SIZE` | integer / `1000` | Maximum characters per chunk |
+| `CHUNK_OVERLAP` | integer / `200` | Characters repeated between windows on the same page |
+| `BATCH_SIZE` | integer / `16` | Texts sent per embedding request |
+| `OPENROUTER_BASE_URL` | URL / `https://openrouter.ai/api/v1` | Base URL used to build the `/embeddings` endpoint |
+| `OPENROUTER_API_KEY` | string / empty | Bearer key required for ingestion and queries |
+| `EMBEDDING_MODEL` | string / `qwen/qwen3-embedding-8b` | Model used to vectorize documents and questions |
+| `QUERY_INSTRUCTION` | string / `Given a web search query, retrieve relevant passages that answer the query` | Instruction added only to questions; empty disables it |
+| `REQUEST_TIMEOUT` | integer / `180` | Maximum seconds per OpenRouter call; also used by the Qdrant server client |
+| `QDRANT_URL` | URL / empty | Empty selects embedded Qdrant; a value selects a server |
+| `QDRANT_API_KEY` | string / empty | Optional credential for a Qdrant server |
+| `QDRANT_PATH` | path / `data/qdrant` | Embedded database directory; ignored when `QDRANT_URL` is set |
+| `QDRANT_COLLECTION` | string / `smart_rag` | Vector collection name |
+| `TOP_K` | integer / `4` | Maximum results requested from Qdrant before applying the context budget |
+| `SCORE_THRESHOLD` | number / `0.3` | Minimum cosine similarity for accepting a result |
+| `MAX_CONTEXT_CHARS` | integer / `6000` | Context character limit, including headers and separators |
+| `QDRANT_IMAGE` | string / `qdrant/qdrant:latest` | Qdrant image used only by Compose |
+| `QDRANT_PORT` | integer / `6333` | Qdrant port published on the host by Compose |
+| `RAG_API_PORT` | integer / `8000` | API port published on the host by Compose |
+
+Size, batch size, Top-K, context budget, and timeout must be positive; `0 <= CHUNK_OVERLAP < CHUNK_SIZE`, and the threshold must be between -1 and 1. Relative paths from `.env` resolve against the project root. An explicit `inspect --documents-dir` path is relative to the current working directory.
+
+## Ingestion and CLI queries
+
+Place PDFs with extractable text in `documents/` and run:
 
 ```bash
 python -m src.main inspect --pages-only
 python -m src.main inspect --chunk-size 1000 --overlap 200
-python -m src.main inspect --documents-dir ./documents
 python -m src.main ingest
-python -m src.main retrieve "Quais são os requisitos?"
-python -m src.main retrieve "Quais são os requisitos?" --top-k 5 --score-threshold 0.4
-python -m src.main --help
+python -m src.main retrieve "What are the requirements?"
+python -m src.main retrieve "What are the requirements?" --top-k 5 --score-threshold 0.4
 ```
 
-`inspect` imprime amostras. `ingest` indexa todos os PDFs e recusa uma coleção
-existente. `retrieve` imprime JSON com o mesmo formato da API. Código de saída:
-0 para sucesso (inclusive nenhum resultado), 1 para erros tratados, 2 para
-argumentos inválidos. Não existe mais o comando `ask`.
+`inspect` shows pages and chunk samples without calling OpenRouter or opening the database. `ingest` indexes all PDFs and refuses to replace an existing collection. `retrieve` prints JSON in the same shape as the API. Exit codes: 0 for success, including empty results; 1 for a handled error; 2 for invalid arguments.
 
-## API HTTP
+| CLI option | Effect |
+| --- | --- |
+| `inspect --pages-only` | Shows pages without generating chunk samples |
+| `inspect --documents-dir PATH` | Overrides `DOCUMENTS_DIR` for this inspection only |
+| `inspect --chunk-size N` | Overrides `CHUNK_SIZE` for this inspection only |
+| `inspect --overlap N` | Overrides `CHUNK_OVERLAP` for this inspection only |
+| `ingest --rebuild` | Replaces the whole collection after preparing new vectors |
+| `retrieve --top-k N` | Overrides `TOP_K` for this query |
+| `retrieve --score-threshold N` | Overrides `SCORE_THRESHOLD` for this query |
 
-Com Qdrant embutido, conclua a ingestão antes de iniciar a API.
-Use um único worker e pare a API antes de outra ingestão pela CLI.
+Rebuild the index after changing PDFs, chunking, or embedding settings:
+
+```bash
+python -m src.main ingest --rebuild
+```
+
+Ingestion reads and vectorizes everything before deleting the previous index, so failures during those stages preserve it. **Replacement is not transactional** after deletion: a failure or interruption can leave the collection incomplete. Coordinate rebuilds with queries. Changing Top-K, threshold, or context budget does not require reindexing. The signature identifies the provider, URL, model, and instruction, but does not detect internal weight changes under the same model ID.
+
+## HTTP API
+
+With embedded Qdrant, finish ingestion before starting the API and use only one process for the same database directory:
 
 ```bash
 python -m uvicorn src.api:app --host 127.0.0.1 --port 8000 --workers 1
 ```
 
-| Rota | Função |
+| Route | Result |
 | --- | --- |
-| `POST /retrieve` | Recupera trechos e contexto |
-| `GET /health` | Retorna `{"status":"ok"}`; somente processo ativo |
-| `GET /docs` | Documentação interativa |
-| `GET /openapi.json` | Esquema OpenAPI |
-
-Basta enviar a pergunta:
+| `POST /retrieve` | Returns context and chunks with sources |
+| `GET /health` | `{"status":"ok"}`; checks process responsiveness only |
+| `GET /docs` / `GET /openapi.json` | Interactive documentation and OpenAPI schema |
 
 ```bash
 curl -X POST http://localhost:8000/retrieve \
   -H 'Content-Type: application/json' \
-  -d '{"question":"Quais são os requisitos?"}'
+  -d '{"question":"What are the requirements?","top_k":4,"score_threshold":0.3}'
 ```
 
-| Campo | Regra |
-| --- | --- |
-| `question` | Obrigatório; 1–10000 caracteres após remover espaços externos |
-| `top_k` | Opcional; inteiro de 1 a 100, padrão `TOP_K` |
-| `score_threshold` | Opcional; número entre -1 e 1, padrão `SCORE_THRESHOLD` |
+| `POST /retrieve` field | Type and rule | Effect |
+| --- | --- | --- |
+| `question` | Required string; 1 to 10000 characters after trimming outer whitespace | Question vectorized for the search |
+| `top_k` | Optional integer from 1 to 100 | Overrides `TOP_K` for this request |
+| `score_threshold` | Optional number between -1 and 1 | Overrides `SCORE_THRESHOLD` for this request |
 
-Omitir ou enviar null nas opções usa os padrões. Campos extras, incluindo
-`model`, são rejeitados. Cada requisição mantém a configuração global intacta.
-Formato de resposta; texto e score abaixo são ilustrativos:
+Omitting an option or sending `null` uses its configured default. Extra fields, including `model`, are rejected. Per-request options do not change subsequent requests.
+
+Illustrative response (the `página` header is emitted literally by the implementation):
 
 ```json
 {
-  "context": "[1] PDF: \"manual.pdf\" | página: 2 | chunk: 0\nO projeto requer Python 3.12.",
+  "context": "[1] PDF: \"manual.pdf\" | página: 2 | chunk: 0\nThe project requires Python 3.12.",
   "chunks": [
     {
       "reference": 1,
@@ -195,138 +149,56 @@ Formato de resposta; texto e score abaixo são ilustrativos:
       "page_number": 2,
       "chunk_index": 0,
       "score": 0.91,
-      "text": "O projeto requer Python 3.12."
+      "text": "The project requires Python 3.12."
     }
   ]
 }
 ```
 
-`context` concatena os trechos com cabeçalhos. `chunks` contém exatamente os
-mesmos trechos, em forma estruturada; `reference` corresponde a `[1]`, `[2]`, etc.
-A resposta pode conter menos de Top-K: o limiar e o orçamento de contexto
-eliminam trechos. Somente chunks completos que cabem no orçamento são retornados;
-se um não couber, um trecho menor posterior ainda pode entrar.
-Sem resultados, retorna HTTP 200 com `{"context":"","chunks":[]}`.
-Não há resposta gerada nem mensagem de abstenção.
+With no suitable passages, the API returns HTTP 200 with `{"context":"","chunks":[]}`. The threshold and context budget can reduce the number of returned chunks below Top-K. A similarity score is not a probability of correctness.
 
-| HTTP | Significado |
+| HTTP | Meaning |
 | --- | --- |
-| 200 | Recuperação concluída, inclusive sem resultados |
-| 400 | Configuração/índice incompatível ou valor inválido no pipeline |
-| 409 | Índice inexistente |
-| 422 | Requisição inválida |
-| 502 | Falha de transporte/resposta do provedor de embeddings |
-| 503 | Chave ausente no servidor ou serviço indisponível |
+| 200 | Retrieval completed, including an empty result |
+| 400 | Invalid pipeline value or incompatible configuration/index |
+| 409 | Index does not exist |
+| 422 | Invalid request body |
+| 502 | OpenRouter transport or response failure |
+| 503 | Missing server key or unavailable service |
 
-Erros usam `{"detail": ...}`; validação 422 retorna lista de erros FastAPI.
-`/health` não verifica índice, créditos ou OpenRouter. Não há endpoint de ingestão
-nem autenticação de consumidores. Mantenha o serviço na rede interna do backend.
+Errors use `{"detail": ...}`; 422 validation follows FastAPI's format. `/health` does not check the index, credits, or OpenRouter. There is no ingestion endpoint or consumer authentication; keep the API on the backend's internal network.
 
-## Consumo pelo backend
+Node.js/TypeScript consumption example:
 
 ```typescript
 const response = await fetch("http://localhost:8000/retrieve", {
   method: "POST",
   headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({ question: "Quais são os requisitos?" }),
+  body: JSON.stringify({ question: "What are the requirements?" }),
 });
-if (!response.ok) {
-  throw new Error(`RAG HTTP ${response.status}: ${await response.text()}`);
-}
+if (!response.ok) throw new Error(`RAG HTTP ${response.status}: ${await response.text()}`);
 const { context, chunks } = await response.json();
+// Use context in your LLM prompt and chunks to display sources.
 ```
 
-O backend usa `context` no prompt do próprio LLM, ou monta seu contexto a partir
-de `chunks`. Ele também controla histórico, idioma, modelo, resposta final e
-exibição das fontes. Os documentos recuperados são dados, não instruções a executar.
+## Python usage
 
-## Consumo em Python
+Run from the repository root or add it to `PYTHONPATH`:
 
 ```python
 from dataclasses import asdict
 from src.rag import RAG
 
 with RAG() as rag:
-    result = rag.retrieve("Quais são os requisitos?")
+    result = rag.retrieve("What are the requirements?", top_k=4)
     payload = asdict(result)
 ```
 
-```python
-from src.rag import RAG
+`RAG(settings)` accepts a `Settings` instance; without an argument it loads `.env`. `RAG.ingest(rebuild=False)` returns the chunk count. `retrieve()` returns `RetrievalResponse(context, chunks)` and propagates exceptions; `IndexNotReadyError` means the collection is missing. Without `with`, call `rag.close()`. Each instance serializes operations with a lock; separate processes do not share that lock.
 
-with RAG() as rag:
-    count = rag.ingest(rebuild=False)
-```
+## Qdrant and Docker Compose
 
-Execute da raiz ou inclua-a no `PYTHONPATH`. `RAG(settings)` aceita `Settings`;
-sem argumento carrega `.env`. `retrieve()` aceita `top_k` e `score_threshold`
-opcionais e retorna `RetrievalResponse`. `ingest()` retorna a quantidade de chunks.
-Sem `with`, feche com `rag.close()`. Exceções são propagadas;
-`IndexNotReadyError` indica índice ausente.
-
-Cada instância serializa suas operações com um lock. A API mantém uma instância
-e a fecha ao parar. O banco embutido permite um processo por pasta. Para múltiplos
-processos use Qdrant servidor; o lock não coordena instâncias diferentes.
-
-## Componentes e contratos
-
-| Arquivo | Função |
-| --- | --- |
-| `src/config.py` | Configuração e validação |
-| `src/pdf_loader.py` | PDF → DocumentPage |
-| `src/chunker.py` | Páginas → DocumentChunk |
-| `src/llm_client.py` | HTTP JSON autenticado para embeddings |
-| `src/embeddings.py` | Vetores dos textos e perguntas |
-| `src/vector_store.py` | Persistência, assinatura e busca cosseno |
-| `src/ingest.py` | Coordenação da ingestão |
-| `src/retriever.py` | Top-K e montagem de contexto |
-| `src/rag.py` | Interface Python pública |
-| `src/api.py` | Interface HTTP pública |
-| `src/main.py` | CLI |
-
-```text
-DocumentPage: source, page_number, text
-DocumentChunk: source, page_number, chunk_index, text
-SearchHit: chunk, score
-Context: text, sources
-RetrievedChunk: reference, source, page_number, chunk_index, score, text
-RetrievalResponse: context, chunks
-```
-
-PDFs são lidos por nome, somente `*.pdf` diretamente na pasta. Páginas começam
-em 1; páginas vazias são ignoradas sem renumerar as seguintes. `source` inclui
-a extensão. Pasta inválida/PDF ilegível gera erro. Não há OCR.
-
-Chunks não cruzam páginas; `chunk_index` começa em 0 por página. As janelas
-avançam `chunk_size - overlap` caracteres Unicode (não tokens), podem cortar
-palavras e ignoram janelas só de espaços. A última pode ser menor.
-
-Embeddings usam `POST /embeddings`, Bearer e `encoding_format=float`.
-A resposta é ordenada por `data[].index`. Quantidade, índices, dimensões,
-valores finitos e vetores não nulos são validados. Documentos não recebem prefixo;
-perguntas usam `Instruct: {QUERY_INSTRUCTION}\nQuery: {question}`.
-
-Qdrant usa dimensão detectada, distância cosseno e IDs UUID5 da serialização
-estável dos campos do chunk. O payload guarda esses campos e a assinatura de
-provedor/URL/modelo/instrução. A busca verifica assinatura e dimensão.
-
-## Reconstrução
-
-```bash
-python -m src.main ingest --rebuild
-```
-
-Reconstrua após mudanças nos PDFs, chunking ou configuração de embeddings.
-Mudar Top-K, limiar ou orçamento não exige reconstrução. Mudanças nos pesos ou
-roteamento sob o mesmo ID de modelo não são detectadas pela assinatura.
-
-Leitura e embeddings são concluídos antes de apagar o índice anterior. Falhas
-nessas etapas ou falta de texto o preservam. A substituição **não é transacional**:
-após exclusão não há rollback. Falhas na escrita tentam excluir a coleção parcial;
-interrupções abruptas podem deixá-la incompleta. Coordene reconstruções para não
-coincidirem com consultas e use uma coleção dedicada.
-
-## Docker e Qdrant
+Without `QDRANT_URL`, embedded Qdrant persists in `data/qdrant/`. With a URL, the client uses a server; the two modes have independent indexes. To use Docker Qdrant from host Python, set `QDRANT_URL=http://localhost:6333` and ingest in that mode.
 
 ```bash
 docker compose build app api
@@ -334,38 +206,13 @@ docker compose up -d qdrant
 docker compose run --rm app ingest
 docker compose up -d api
 curl http://localhost:8000/health
-docker compose run --rm app retrieve "Quais são os requisitos?"
+docker compose run --rm app retrieve "What are the requirements?"
 docker compose down
 ```
 
-O serviço `api` executa Uvicorn com um worker. `app` usa o perfil `cli` e roda
-sob demanda. Um backend na mesma rede Docker usa `http://api:8000/retrieve`;
-no host usa `http://localhost:8000/retrieve`. Ajuste a porta com `RAG_API_PORT`.
-A porta 6333 é do banco, não do serviço de recuperação.
+The `app` service is an on-demand CLI; `api` runs one worker. On the Compose network, the backend calls `http://api:8000/retrieve`; from the host, use `http://localhost:8000/retrieve`. Compose mounts PDFs only in the CLI, publishes ports on `127.0.0.1`, and persists data in the `qdrant_storage` and `qdrant_snapshots` volumes. `docker compose down` preserves the volumes; `down -v` removes them. `depends_on` waits for the Qdrant container to start, not for service readiness.
 
-O Compose repassa `.env` e fixa `DOCUMENTS_DIR=/app/documents`,
-`QDRANT_URL=http://qdrant:6333` e `QDRANT_API_KEY` vazia. A CLI monta os PDFs
-somente para leitura; a API não precisa dessa pasta. Portas são publicadas em
-127.0.0.1. O Qdrant do Compose não configura autenticação. Seu `depends_on`
-verifica início, não prontidão: consulte os logs e repita se ainda estiver iniciando.
-
-Volumes `qdrant_storage` e `qdrant_snapshots` persistem após `down`;
-`down -v` apaga os dados. O Dockerfile usa usuário não root e Python 3.12 slim.
-`.env`, `.venv`, PDFs, testes e bancos não entram na imagem. Reconstrua a imagem
-ao atualizar código/dependências. Tags são mutáveis; fixe digests para reprodução
-exata. Dependências transitivas não têm lockfile.
-
-Sem `QDRANT_URL`, o Python usa banco embutido em `data/qdrant`. Para usar o
-servidor Docker a partir do host, configure o trecho abaixo. Modos embutido e
-servidor não compartilham índices; faça ingestão no modo escolhido.
-
-```dotenv
-QDRANT_URL=http://localhost:6333
-```
-
-Se mudar `QDRANT_PORT`, ajuste essa URL no host. A URL interna não muda.
-
-## Testes e diagnóstico
+## Tests and limitations
 
 ```bash
 python -m unittest discover -s tests -v
@@ -373,38 +220,6 @@ python -m pip check
 docker compose config --quiet
 ```
 
-Testes usam PDFs temporários, Qdrant real local e embeddings simulados. Cobrem
-extração, chunks, ranking, persistência, reconstrução, assinatura, orçamento,
-autenticação, contrato HTTP, resultados vazios e fechamento do banco. Verificam
-que as chamadas são somente de embeddings. Não avaliam qualidade do modelo nem
-consomem créditos. Python usado na validação: 3.12.14.
+Tests use temporary PDFs, local Qdrant, and mocked OpenRouter responses; they consume no credits and do not assess model quality. The project has no OCR, reranking, incremental updates, conversation history, or streaming. Ingestion holds pages, chunks, and vectors in memory; tables and reading order depend on PDF extraction. A character limit does not guarantee that the context fits the consuming LLM's token window.
 
-- Chave ausente: preencha `OPENROUTER_API_KEY`.
-- Erros OpenRouter 401/403: chave/acesso; 402: créditos; 429: aguarde e reduza chamadas.
-  Na API HTTP de recuperação, erros de provedor são apresentados como 502.
-- Não há retry automático; timeout usa `REQUEST_TIMEOUT`.
-- Índice incompatível/existente: use `ingest --rebuild` quando quiser substituí-lo.
-- Nenhum texto: confira pasta, extensão e se o PDF possui texto extraível.
-- Nenhum trecho: confira limiar, documentos e `MAX_CONTEXT_CHARS`.
-- Banco embutido bloqueado: feche o outro processo ou use servidor.
-- Docker sem permissão: confira acesso do usuário ao daemon.
-
-## Limites e migração
-
-O consumidor deve migrar de `/ask` para `/retrieve`, de `RAG.ask()` para
-`RAG.retrieve()` e de resposta gerada para `context`/`chunks`. Não envie `model`.
-Atualizar o código de recuperação não exige reindexar se os embeddings não mudaram.
-
-Não há OCR, reranker, ingestão incremental, histórico ou streaming. Páginas,
-chunks e vetores são mantidos em memória durante ingestão. Similaridade não é
-probabilidade de acerto. A ordem de leitura e tabelas dependem do PDF.
-O orçamento em caracteres não garante encaixe na janela do LLM do consumidor.
-
-Documentos e perguntas são enviados à OpenRouter para embeddings. Nenhum LLM
-de geração recebe o contexto por este serviço. Chaves, PDFs e dados locais
-são excluídos do Git; a chave não deve ser versionada.
-
-Para equivalência em TypeScript, preserve metadados, numeração, prefixo da
-consulta, cosseno e recorte Unicode com `Array.from(text)`. Se compartilhar IDs,
-reproduza a serialização usada pelo UUID5.
-# smart_rag
+Document text and questions are sent to OpenRouter for embeddings. This service **does not** send retrieved context to a generation model. Keep keys, PDFs, and local data out of Git.
